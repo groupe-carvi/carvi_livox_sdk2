@@ -1,0 +1,490 @@
+use once_cell::sync::Lazy;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+use walkdir::WalkDir;
+
+static PROJECT_ROOT: Lazy<PathBuf> = Lazy::new(|| {
+    PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| env::current_dir().unwrap().to_str().unwrap().to_string()),
+    )
+});
+
+static TARGET_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    let target_dir = env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PROJECT_ROOT.join("target"));
+
+    if target_dir.is_absolute() {
+        target_dir
+    } else {
+        PROJECT_ROOT.join(target_dir)
+    }
+});
+
+// A stable cache location for build-time vendored dependencies.
+// This is intentionally inside `target/` so it does not pollute the repository.
+static VENDOR_FOLDER_PATH: Lazy<PathBuf> = Lazy::new(|| TARGET_DIR.join("vendor"));
+
+const LIVOX_SDK2_REPOSITORY_URL: &str = "https://github.com/Livox-SDK/Livox-SDK2.git";
+const LIVOX_SDK2_TAG_DEFAULT: &str = "v1.2.5";
+
+const LIVOX_SDK2_ROOT_ENV: &str = "LIVOX_SDK2_ROOT";
+const LIVOX_SDK2_INCLUDE_ENV: &str = "LIVOX_SDK2_INCLUDE_DIR";
+const LIVOX_SDK2_LIB_ENV: &str = "LIVOX_SDK2_LIB_DIR";
+const LIVOX_SDK2_SOURCE_ENV: &str = "LIVOX_SDK2_SOURCE";
+const LIVOX_SDK2_REPO_ENV: &str = "LIVOX_SDK2_REPOSITORY";
+const LIVOX_SDK2_TAG_ENV: &str = "LIVOX_SDK2_TAG";
+const LIVOX_SDK2_AUTO_DOWNLOAD_ENV: &str = "LIVOX_SDK2_AUTO_DOWNLOAD";
+const LIVOX_SDK2_LINK_ENV: &str = "LIVOX_SDK2_LINK";
+
+macro_rules! println_build {
+    ($($tokens:tt)*) => {
+        println!("cargo:warning=\r\x1b[32;1m   {}", format!($($tokens)*))
+    };
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/bindings.rs");
+    println!("cargo:rerun-if-changed=src/ffi/livox_wrapper.hpp");
+    println!("cargo:rerun-if-changed=src/ffi/livox_wrapper.cpp");
+
+    // Configuration env vars.
+    for key in [
+        LIVOX_SDK2_ROOT_ENV,
+        LIVOX_SDK2_INCLUDE_ENV,
+        LIVOX_SDK2_LIB_ENV,
+        LIVOX_SDK2_SOURCE_ENV,
+        LIVOX_SDK2_REPO_ENV,
+        LIVOX_SDK2_TAG_ENV,
+        LIVOX_SDK2_AUTO_DOWNLOAD_ENV,
+        LIVOX_SDK2_LINK_ENV,
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
+    ensure_directory(&VENDOR_FOLDER_PATH);
+
+    let link_mode = choose_link_mode();
+
+    // Resolve include/lib directories either via system install or vendored build.
+    let (include_dir, lib_dir) = if cfg!(feature = "system") {
+        resolve_system_paths()
+    } else if cfg!(feature = "vendored") {
+        let (src_root, tag) = ensure_livox_sdk2_source();
+        apply_livox_sdk2_patches(&src_root);
+        track_livox_sdk2_sources(&src_root);
+        build_livox_sdk2(&src_root, &tag)
+    } else {
+        // Safety net: default to vendored behavior.
+        let (src_root, tag) = ensure_livox_sdk2_source();
+        apply_livox_sdk2_patches(&src_root);
+        track_livox_sdk2_sources(&src_root);
+        build_livox_sdk2(&src_root, &tag)
+    };
+
+    emit_link_directives(&lib_dir, link_mode);
+    build_bindings(&include_dir);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkMode {
+    Static,
+    Shared,
+}
+
+fn choose_link_mode() -> LinkMode {
+    // Priority: explicit env var > cargo features > default static.
+    if let Ok(v) = env::var(LIVOX_SDK2_LINK_ENV) {
+        match v.as_str() {
+            "static" => return LinkMode::Static,
+            "shared" | "dynamic" | "dylib" => return LinkMode::Shared,
+            _ => {
+                println_build!(
+                    "Unrecognized {LIVOX_SDK2_LINK_ENV}={v:?} (expected 'static' or 'shared'); defaulting to static"
+                );
+            }
+        }
+    }
+
+    if cfg!(feature = "link-shared") {
+        return LinkMode::Shared;
+    }
+
+    LinkMode::Static
+}
+
+fn ensure_directory(path: &Path) {
+    if let Err(err) = fs::create_dir_all(path) {
+        panic!("Failed to create directory {}: {err}", path.display());
+    }
+}
+
+fn resolve_system_paths() -> (PathBuf, PathBuf) {
+    // Preference order:
+    // 1) Explicit include/lib vars
+    // 2) Root prefix + include/lib
+    // 3) A last-ditch attempt via common system paths (not implemented; we prefer explicit)
+
+    let include = env::var(LIVOX_SDK2_INCLUDE_ENV).ok().map(PathBuf::from);
+    let lib = env::var(LIVOX_SDK2_LIB_ENV).ok().map(PathBuf::from);
+
+    if let (Some(include_dir), Some(lib_dir)) = (include.as_ref(), lib.as_ref()) {
+        return (include_dir.clone(), lib_dir.clone());
+    }
+
+    let root = env::var(LIVOX_SDK2_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            panic!(
+                "System mode requires either {LIVOX_SDK2_ROOT_ENV} or both {LIVOX_SDK2_INCLUDE_ENV} and {LIVOX_SDK2_LIB_ENV}."
+            )
+        });
+
+    let include_dir = include.unwrap_or_else(|| root.join("include"));
+    let lib_dir = lib.unwrap_or_else(|| root.join("lib"));
+
+    if !include_dir.join("livox_lidar_api.h").exists() {
+        println_build!(
+            "Warning: {} does not contain livox_lidar_api.h",
+            include_dir.display()
+        );
+    }
+
+    (include_dir, lib_dir)
+}
+
+fn ensure_livox_sdk2_source() -> (PathBuf, String) {
+    // 1) User-provided source path
+    if let Ok(src) = env::var(LIVOX_SDK2_SOURCE_ENV) {
+        let src_root = PathBuf::from(src);
+        if !src_root.join("CMakeLists.txt").exists() {
+            panic!(
+                "{LIVOX_SDK2_SOURCE_ENV}={} does not look like a Livox-SDK2 source tree (missing CMakeLists.txt)",
+                src_root.display()
+            );
+        }
+        println_build!("Using Livox-SDK2 source from {LIVOX_SDK2_SOURCE_ENV}={}", src_root.display());
+        return (src_root, "local".to_string());
+    }
+
+    // 2) Vendored clone in target/vendor
+    let repo_url = env::var(LIVOX_SDK2_REPO_ENV)
+        .unwrap_or_else(|_| LIVOX_SDK2_REPOSITORY_URL.to_string());
+    let tag = env::var(LIVOX_SDK2_TAG_ENV).unwrap_or_else(|_| LIVOX_SDK2_TAG_DEFAULT.to_string());
+
+    let auto = env::var(LIVOX_SDK2_AUTO_DOWNLOAD_ENV)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+
+    if !auto {
+        panic!(
+            "Vendored build requires fetching Livox-SDK2. Set {LIVOX_SDK2_AUTO_DOWNLOAD_ENV}=1 (or omit it), or use {LIVOX_SDK2_SOURCE_ENV} / feature 'system'."
+        );
+    }
+
+    let safe_tag = sanitize_for_path(&tag);
+    let dest = VENDOR_FOLDER_PATH.join(format!("livox-sdk2-{safe_tag}"));
+
+    if dest.exists() && dest.join(".git").exists() {
+        println_build!("Using existing Livox-SDK2 checkout at {}", dest.display());
+        return (dest, tag);
+    }
+
+    println_build!("Cloning Livox-SDK2 ({tag}) into {}...", dest.display());
+    clone_repository(&repo_url, &dest, Some(&tag))
+        .unwrap_or_else(|err| panic!("Failed to clone Livox-SDK2 repository: {err}"));
+
+    (dest, tag)
+}
+
+fn sanitize_for_path(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn clone_repository(repo_url: &str, dest_path: &Path, tag: Option<&str>) -> Result<(), String> {
+    if dest_path.exists() {
+        if dest_path.join(".git").exists() {
+            return Ok(());
+        }
+        return Err(format!(
+            "Destination {} exists and is not a git repository",
+            dest_path.display()
+        ));
+    }
+
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+
+    let mut args = vec!["clone", "--recurse-submodules"];
+    if let Some(tag_name) = tag {
+        args.push("--branch");
+        args.push(tag_name);
+    }
+    args.push(repo_url);
+    args.push(
+        dest_path
+            .to_str()
+            .ok_or_else(|| "Invalid destination for git clone".to_string())?,
+    );
+
+    println_build!("Running git {}", args.join(" "));
+
+    let status = Command::new("git")
+        .args(args)
+        .status()
+        .map_err(|e| format!("Failed to spawn git: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("git clone failed with status {status}"));
+    }
+
+    Ok(())
+}
+
+fn track_livox_sdk2_sources(src_root: &Path) {
+    watch_path(&src_root.join("CMakeLists.txt"));
+    watch_tree(&src_root.join("sdk_core"));
+    watch_tree(&src_root.join("include"));
+    watch_tree(&src_root.join("3rdparty"));
+}
+
+fn apply_livox_sdk2_patches(src_root: &Path) {
+    // Livox-SDK2 v1.2.x has a few headers that use fixed-width integer types
+    // without including <cstdint> (or <stdint.h>), which breaks compilation on
+    // some toolchains.
+    //
+    // We patch the vendored checkout (inside target/) in a small, idempotent way.
+
+    add_include_cstdint_after(
+        &src_root.join("sdk_core/comm/define.h"),
+        "#include <stdio.h>",
+    );
+
+    add_include_cstdint_after(
+        &src_root.join("sdk_core/logger_handler/file_manager.h"),
+        "#include <map>",
+    );
+}
+
+fn add_include_cstdint_after(path: &Path, marker_line: &str) {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+
+    if contents.contains("#include <cstdint>") {
+        return;
+    }
+
+    let marker_pos = match contents.find(marker_line) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Insert after the end of the marker line (support both LF and CRLF).
+    let after_marker = &contents[marker_pos..];
+    let eol_rel = after_marker
+        .find('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(after_marker.len());
+    let insert_pos = marker_pos + eol_rel;
+
+    let mut patched = String::with_capacity(contents.len() + 20);
+    patched.push_str(&contents[..insert_pos]);
+    patched.push_str("#include <cstdint>\n");
+    patched.push_str(&contents[insert_pos..]);
+
+    if let Err(e) = fs::write(path, patched) {
+        println_build!("Failed to apply compatibility patch to {}: {e}", path.display());
+        return;
+    }
+
+    println_build!("Applied compatibility patch: added <cstdint> to {}", path.display());
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn watch_path(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn watch_tree(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+
+    for entry in WalkDir::new(root).into_iter().filter_map(|res| res.ok()) {
+        let path = entry.path();
+        if path
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+        {
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
+    // Use a stable build/install directory under target/ to avoid rebuilding on every OUT_DIR.
+    let safe_tag = sanitize_for_path(tag);
+    let build_root = TARGET_DIR
+        .join("vendor-build")
+        .join(format!("livox-sdk2-{safe_tag}"));
+    let build_dir = build_root.join("build");
+    let install_dir = build_root.join("install");
+
+    let include_dir = install_dir.join("include");
+    let lib_dir = install_dir.join("lib");
+
+    // Quick cache check
+    let static_ok = lib_dir.join("liblivox_lidar_sdk_static.a").exists();
+    let shared_ok = lib_dir
+        .join("liblivox_lidar_sdk_shared.so")
+        .exists();
+    let headers_ok = include_dir.join("livox_lidar_api.h").exists();
+
+    if headers_ok && (static_ok || shared_ok) {
+        println_build!(
+            "Using cached Livox-SDK2 build at {}",
+            install_dir.display()
+        );
+        return (include_dir, lib_dir);
+    }
+
+    ensure_directory(&build_dir);
+    ensure_directory(&install_dir);
+
+    println_build!(
+        "Configuring Livox-SDK2 with CMake (build dir: {})",
+        build_dir.display()
+    );
+
+    let mut configure = Command::new("cmake");
+    configure
+        .arg("-S")
+        .arg(src_root)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+    run_cmd(&mut configure, "cmake configure");
+
+    println_build!("Building + installing Livox-SDK2...");
+    let mut build = Command::new("cmake");
+    build
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("install")
+        .arg("--config")
+        .arg("Release");
+    run_cmd(&mut build, "cmake build");
+
+    if !include_dir.join("livox_lidar_api.h").exists() {
+        panic!(
+            "Livox-SDK2 install did not produce expected headers in {}",
+            include_dir.display()
+        );
+    }
+
+    (include_dir, lib_dir)
+}
+
+fn run_cmd(cmd: &mut Command, what: &str) {
+    println_build!("Running: {:?}", cmd);
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("Failed to run {what}: {e}"));
+    if !status.success() {
+        panic!("Command failed ({what}) with status {status}");
+    }
+}
+
+fn emit_link_directives(lib_dir: &Path, link_mode: LinkMode) {
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    match link_mode {
+        LinkMode::Static => {
+            println!("cargo:rustc-link-lib=static=livox_lidar_sdk_static");
+        }
+        LinkMode::Shared => {
+            println!("cargo:rustc-link-lib=dylib=livox_lidar_sdk_shared");
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    {
+        // The upstream CMakeLists sets `-pthread` on UNIX.
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        // When linking against C++ libraries, ensure the C++ runtime is available.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+    }
+}
+
+fn build_bindings(include_dir: &Path) {
+    let mut include_paths = vec![PROJECT_ROOT.join("src"), PROJECT_ROOT.join("src/ffi"), include_dir.to_path_buf()];
+    include_paths.retain(|p| p.exists());
+
+    // Get GCC system include paths to help clang find standard headers.
+    let gcc_include_output = Command::new("gcc")
+        .args(["-E", "-Wp,-v", "-xc++", "/dev/null"])
+        .output()
+        .ok();
+
+    let mut extra_args = vec!["-std=c++17".to_string()];
+
+    if let Some(output) = gcc_include_output {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('/') && (trimmed.contains("include") || trimmed.contains("gcc")) {
+                extra_args.push(format!("-I{}", trimmed));
+            }
+        }
+    }
+
+    let include_refs: Vec<&Path> = include_paths.iter().map(|p| p.as_path()).collect();
+    let extra_args_refs: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+
+    let builder = autocxx_build::Builder::new("src/bindings.rs", &include_refs)
+        .extra_clang_args(&extra_args_refs);
+
+    let mut cc_builder = builder
+        .build()
+        .expect("Unable to generate bindings for Livox-SDK2");
+
+    for dir in &include_paths {
+        cc_builder.include(dir);
+    }
+
+    cc_builder
+        .file(PROJECT_ROOT.join("src/ffi/livox_wrapper.cpp"))
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-deprecated-declarations")
+        .compile("carvi_livox_sdk2_binding");
+}
