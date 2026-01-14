@@ -23,6 +23,7 @@ cxx = "1.0"
 [dev-dependencies]
 anyhow = "1.0.100"
 rerun = { version = "0.28.1", features = ["web_viewer"] }
+re_web_viewer_server = "0.28.1"
 
 [build-dependencies]
 autocxx-build = "0.30.0"

@@ -1414,6 +1414,7 @@ dependencies = [
  "cxx",
  "once_cell",
  "pkg-config",
+ "re_web_viewer_server",
  "rerun",
  "walkdir",
 ]

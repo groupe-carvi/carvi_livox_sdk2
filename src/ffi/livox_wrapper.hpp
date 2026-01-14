@@ -12,6 +12,12 @@ inline bool sdk_init(const char* config_path) {
   return LivoxLidarSdkInit(config_path);
 }
 
+// Explicit host-ip variant. Some devices/firmware require a non-empty host_ip
+// to verify network segment and complete initialization.
+inline bool sdk_init_with_host_ip(const char* config_path, const char* host_ip) {
+  return LivoxLidarSdkInit(config_path, host_ip ? host_ip : "", nullptr);
+}
+
 inline void sdk_uninit() {
   LivoxLidarSdkUninit();
 }
@@ -21,7 +27,9 @@ inline bool sdk_start() {
 }
 
 inline void sdk_stop() {
-  LivoxLidarSdkUninit();
+  // Livox-SDK2 does not provide a dedicated "stop" API (only init/start/uninit).
+  // This wrapper is kept for backwards compatibility with earlier iterations
+  // of this crate; it is intentionally a no-op.
 }
 
 // Wrapper for setting point cloud callback.
