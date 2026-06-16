@@ -355,10 +355,11 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
     let lib_dir = install_dir.join("lib");
 
     // Quick cache check
-    let static_ok = lib_dir.join("liblivox_lidar_sdk_static.a").exists();
-    let shared_ok = lib_dir
-        .join("liblivox_lidar_sdk_shared.so")
-        .exists();
+    let static_ok = lib_dir.join("liblivox_lidar_sdk_static.a").exists()
+        || lib_dir.join("livox_lidar_sdk_static.lib").exists();
+    let shared_ok = lib_dir.join("liblivox_lidar_sdk_shared.so").exists()
+        || lib_dir.join("livox_lidar_sdk_shared.dll").exists()
+        || lib_dir.join("liblivox_lidar_sdk_shared.dll").exists();
     let headers_ok = include_dir.join("livox_lidar_api.h").exists();
 
     if headers_ok && (static_ok || shared_ok) {
@@ -386,6 +387,16 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
         .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+
+    // On Windows (MinGW/GCC toolchain), Winsock symbols live in ws2_32 and
+    // iphlpapi. These are not linked automatically by the Livox SDK2 CMake
+    // build, causing undefined-reference errors for socket/bind/etc.
+    if cfg!(target_os = "windows") {
+        configure
+            .arg("-DCMAKE_SHARED_LINKER_FLAGS=-lws2_32 -liphlpapi")
+            .arg("-DCMAKE_EXE_LINKER_FLAGS=-lws2_32 -liphlpapi");
+    }
+
     run_cmd(&mut configure, "cmake configure");
 
     println_build!("Building + installing Livox-SDK2...");
