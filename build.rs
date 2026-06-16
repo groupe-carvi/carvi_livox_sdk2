@@ -278,6 +278,9 @@ fn apply_livox_sdk2_patches(src_root: &Path) {
         &src_root.join("sdk_core/logger_handler/file_manager.h"),
         "#include <map>",
     );
+
+    make_samples_optional(&src_root.join("CMakeLists.txt"));
+    add_windows_net_libs(&src_root.join("sdk_core/CMakeLists.txt"));
 }
 
 fn add_include_cstdint_after(path: &Path, marker_line: &str) {
@@ -313,6 +316,87 @@ fn add_include_cstdint_after(path: &Path, marker_line: &str) {
     }
 
     println_build!("Applied compatibility patch: added <cstdint> to {}", path.display());
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn make_samples_optional(path: &Path) {
+    let Ok(original) = fs::read_to_string(path) else {
+        return;
+    };
+
+    let mut patched = original.clone();
+
+    if !patched.contains("option(LIVOX_SDK2_BUILD_SAMPLES") {
+        if let Some(project_pos) = patched.find("project(livox_sdk2)") {
+            let after_project = &patched[project_pos..];
+            let eol_rel = after_project
+                .find('\n')
+                .map(|idx| idx + 1)
+                .unwrap_or(after_project.len());
+            let insert_pos = project_pos + eol_rel;
+            patched.insert_str(
+                insert_pos,
+                "option(LIVOX_SDK2_BUILD_SAMPLES \"Build Livox-SDK2 sample binaries\" ON)\n",
+            );
+        }
+    }
+
+    let old_samples_line = "add_subdirectory(samples)";
+    let new_samples_guard = "if(LIVOX_SDK2_BUILD_SAMPLES)\n  add_subdirectory(samples)\nendif()";
+
+    if patched.contains(old_samples_line) {
+        patched = patched.replacen(old_samples_line, new_samples_guard, 1);
+    }
+
+    if patched == original {
+        return;
+    }
+
+    if let Err(e) = fs::write(path, patched) {
+        println_build!("Failed to patch sample toggles in {}: {e}", path.display());
+        return;
+    }
+
+    println_build!(
+        "Applied compatibility patch: made Livox-SDK2 sample build optional in {}",
+        path.display()
+    );
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn add_windows_net_libs(path: &Path) {
+    let Ok(original) = fs::read_to_string(path) else {
+        return;
+    };
+
+    if original.contains("target_link_libraries(${SDK_LIBRARY_SHARED} PRIVATE ws2_32 iphlpapi)") {
+        return;
+    }
+
+    let marker = "install(TARGETS ${SDK_LIBRARY_STATIC} ${SDK_LIBRARY_SHARED}";
+    let Some(marker_pos) = original.find(marker) else {
+        return;
+    };
+
+    let link_block = "if(WIN32)\n\
+target_link_libraries(${SDK_LIBRARY_STATIC} PRIVATE ws2_32 iphlpapi)\n\
+target_link_libraries(${SDK_LIBRARY_SHARED} PRIVATE ws2_32 iphlpapi)\n\
+endif()\n\n";
+
+    let mut patched = String::with_capacity(original.len() + link_block.len());
+    patched.push_str(&original[..marker_pos]);
+    patched.push_str(link_block);
+    patched.push_str(&original[marker_pos..]);
+
+    if let Err(e) = fs::write(path, patched) {
+        println_build!("Failed to patch Windows net libs in {}: {e}", path.display());
+        return;
+    }
+
+    println_build!(
+        "Applied compatibility patch: added ws2_32/iphlpapi linkage in {}",
+        path.display()
+    );
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
@@ -386,7 +470,8 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
         .arg(&build_dir)
         .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
+        .arg("-DLIVOX_SDK2_BUILD_SAMPLES=OFF");
 
     // On Windows (MinGW/GCC toolchain), Winsock symbols live in ws2_32 and
     // iphlpapi. These are not linked automatically by the Livox SDK2 CMake
@@ -460,21 +545,37 @@ fn build_bindings(include_dir: &Path) {
     let mut include_paths = vec![PROJECT_ROOT.join("src"), PROJECT_ROOT.join("src/ffi"), include_dir.to_path_buf()];
     include_paths.retain(|p| p.exists());
 
-    // Get GCC system include paths to help clang find standard headers.
-    let gcc_include_output = Command::new("gcc")
-        .args(["-E", "-Wp,-v", "-xc++", "/dev/null"])
-        .output()
-        .ok();
-
     let mut extra_args = vec!["-std=c++17".to_string()];
 
-    if let Some(output) = gcc_include_output {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        for line in stderr.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('/') && (trimmed.contains("include") || trimmed.contains("gcc")) {
-                extra_args.push(format!("-I{}", trimmed));
+    if let Ok(target) = env::var("TARGET") {
+        extra_args.push(format!("--target={target}"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Get GCC system include paths to help clang find standard headers.
+        let gcc_include_output = Command::new("gcc")
+            .args(["-E", "-Wp,-v", "-xc++", "/dev/null"])
+            .output()
+            .ok();
+
+        if let Some(output) = gcc_include_output {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('/')
+                    && (trimmed.contains("include") || trimmed.contains("gcc"))
+                {
+                    extra_args.push(format!("-I{}", trimmed));
+                }
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for arg in find_msvc_include_paths() {
+            extra_args.push(arg);
         }
     }
 
@@ -498,4 +599,77 @@ fn build_bindings(include_dir: &Path) {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-deprecated-declarations")
         .compile("carvi_livox_sdk2_binding");
+}
+
+#[cfg(target_os = "windows")]
+fn find_msvc_include_paths() -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    if let Ok(include_env) = env::var("INCLUDE") {
+        for path in include_env.split(';') {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                args.push(format!("-I{}", trimmed));
+            }
+        }
+        if !args.is_empty() {
+            return args;
+        }
+    }
+
+    let vswhere = PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+    );
+    if !vswhere.exists() {
+        println_build!(
+            "vswhere.exe not found; MSVC standard headers may be unavailable for clang. \
+             Consider running from a Visual Studio Developer Command Prompt."
+        );
+        return args;
+    }
+
+    let vs_path = Command::new(&vswhere)
+        .args(["-latest", "-property", "installationPath"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| PathBuf::from(s.trim().to_string()));
+
+    let Some(vs_path) = vs_path else {
+        return args;
+    };
+
+    let msvc_tools = vs_path.join(r"VC\Tools\MSVC");
+    if let Ok(entries) = fs::read_dir(&msvc_tools) {
+        if let Some(latest) = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .max()
+        {
+            let include_dir = msvc_tools.join(&latest).join("include");
+            if include_dir.exists() {
+                args.push(format!("-I{}", include_dir.display()));
+            }
+        }
+    }
+
+    let sdk_include_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include");
+    if let Ok(entries) = fs::read_dir(&sdk_include_root) {
+        if let Some(sdk_version) = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .max()
+        {
+            for sub in &["ucrt", "um", "shared"] {
+                let dir = sdk_include_root.join(&sdk_version).join(sub);
+                if dir.exists() {
+                    args.push(format!("-I{}", dir.display()));
+                }
+            }
+        }
+    }
+
+    args
 }
