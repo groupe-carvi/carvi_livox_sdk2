@@ -475,26 +475,36 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
     );
 
     if is_windows_msvc {
-        let cache_path = build_dir.join("CMakeCache.txt");
-        if let Ok(cache) = fs::read_to_string(&cache_path) {
-            if cache.contains("CMAKE_GENERATOR:INTERNAL=Ninja")
-                || cache.contains("CMAKE_GENERATOR:INTERNAL=MinGW Makefiles")
-            {
-                println_build!(
-                    "Removing incompatible CMake cache at {} (generator mismatch for MSVC target)",
-                    build_dir.display()
-                );
-                let _ = fs::remove_dir_all(&build_dir);
-                ensure_directory(&build_dir);
-            }
-        }
+        let _ = fs::remove_dir_all(&build_dir);
+        ensure_directory(&build_dir);
     }
 
     let mut configure = Command::new("cmake");
+    let mut msvc_path_entries: Vec<PathBuf> = Vec::new();
+    let mut msvc_cl: Option<PathBuf> = None;
     if is_windows_msvc {
-        let generator = env::var("LIVOX_SDK2_CMAKE_GENERATOR")
-            .unwrap_or_else(|_| "Visual Studio 18 2022".to_string());
-        configure.arg("-G").arg(generator).arg("-A").arg("x64");
+        let cl = find_msvc_cl_path()
+            .unwrap_or_else(|| panic!("Unable to locate cl.exe for windows-msvc toolchain"));
+        msvc_cl = Some(cl.clone());
+        if let Some(cl_dir) = cl.parent() {
+            msvc_path_entries.push(cl_dir.to_path_buf());
+        }
+        if let Some(sdk_bin_x64) = find_windows_sdk_bin_x64() {
+            msvc_path_entries.push(sdk_bin_x64);
+        }
+        configure
+            .arg("-G")
+            .arg("Ninja")
+            .arg(format!("-DCMAKE_C_COMPILER={}", cl.display()))
+            .arg(format!("-DCMAKE_CXX_COMPILER={}", cl.display()))
+            .arg("-DCMAKE_RC_COMPILER=rc")
+            .arg("-DCMAKE_MT=mt")
+            .arg("-DCMAKE_TRY_COMPILE_CONFIGURATION=Release")
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL");
+        apply_path_overrides(&mut configure, &msvc_path_entries);
+        if let Some(cl_path) = msvc_cl.as_deref() {
+            apply_msvc_env_overrides(&mut configure, cl_path);
+        }
     }
     configure
         .arg("-S")
@@ -509,7 +519,7 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
     // On Windows (MinGW/GCC toolchain), Winsock symbols live in ws2_32 and
     // iphlpapi. These are not linked automatically by the Livox SDK2 CMake
     // build, causing undefined-reference errors for socket/bind/etc.
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") && !is_windows_msvc {
         configure
             .arg("-DCMAKE_SHARED_LINKER_FLAGS=-lws2_32 -liphlpapi")
             .arg("-DCMAKE_EXE_LINKER_FLAGS=-lws2_32 -liphlpapi");
@@ -526,6 +536,12 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
         .arg("install")
         .arg("--config")
         .arg("Release");
+    if is_windows_msvc {
+        apply_path_overrides(&mut build, &msvc_path_entries);
+        if let Some(cl_path) = msvc_cl.as_deref() {
+            apply_msvc_env_overrides(&mut build, cl_path);
+        }
+    }
     run_cmd(&mut build, "cmake build");
 
     if !include_dir.join("livox_lidar_api.h").exists() {
@@ -632,6 +648,119 @@ fn build_bindings(include_dir: &Path) {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-deprecated-declarations")
         .compile("carvi_livox_sdk2_binding");
+}
+
+#[cfg(target_os = "windows")]
+fn find_msvc_cl_path() -> Option<PathBuf> {
+    let vswhere = PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+    );
+    if !vswhere.exists() {
+        return None;
+    }
+
+    let install_path = Command::new(&vswhere)
+        .args(["-latest", "-property", "installationPath"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| PathBuf::from(s.trim().to_string()))?;
+
+    let msvc_tools = install_path.join(r"VC\Tools\MSVC");
+    let latest = fs::read_dir(&msvc_tools)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .max()?;
+
+    let cl = latest.join(r"bin\Hostx64\x64\cl.exe");
+    cl.exists().then_some(cl)
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_sdk_bin_x64() -> Option<PathBuf> {
+    let sdk_bin_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    let latest_version_dir = fs::read_dir(&sdk_bin_root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                Some((name, e.path()))
+            } else {
+                None
+            }
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, path)| path)?;
+    Some(latest_version_dir.join("x64"))
+}
+
+fn apply_path_overrides(cmd: &mut Command, prepended_paths: &[PathBuf]) {
+    if prepended_paths.is_empty() {
+        return;
+    }
+
+    let mut merged = prepended_paths.to_vec();
+    if let Some(path) = env::var_os("PATH") {
+        merged.extend(env::split_paths(&path));
+    }
+
+    if let Ok(joined) = env::join_paths(merged) {
+        cmd.env("PATH", joined);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_msvc_env_overrides(cmd: &mut Command, cl_path: &Path) {
+    let mut include_paths: Vec<PathBuf> = Vec::new();
+    let mut lib_paths: Vec<PathBuf> = Vec::new();
+
+    if let Some(msvc_root) = msvc_root_from_cl_path(cl_path) {
+        include_paths.push(msvc_root.join("include"));
+        lib_paths.push(msvc_root.join("lib").join("x64"));
+    }
+
+    if let Some(sdk_version) = find_windows_sdk_version() {
+        let sdk_include_root = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include")
+            .join(&sdk_version);
+        for sub in ["ucrt", "um", "shared"] {
+            include_paths.push(sdk_include_root.join(sub));
+        }
+
+        let sdk_lib_root =
+            PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Lib").join(&sdk_version);
+        for sub in ["ucrt", "um"] {
+            lib_paths.push(sdk_lib_root.join(sub).join("x64"));
+        }
+    }
+
+    include_paths.retain(|path| path.exists());
+    lib_paths.retain(|path| path.exists());
+
+    if let Ok(include) = env::join_paths(include_paths) {
+        cmd.env("INCLUDE", include);
+    }
+    if let Ok(lib) = env::join_paths(lib_paths) {
+        cmd.env("LIB", &lib);
+        cmd.env("LIBPATH", lib);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn msvc_root_from_cl_path(cl_path: &Path) -> Option<PathBuf> {
+    Some(cl_path.parent()?.parent()?.parent()?.parent()?.to_path_buf())
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_sdk_version() -> Option<String> {
+    find_windows_sdk_bin_x64()?
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(target_os = "windows")]
