@@ -437,13 +437,25 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
 
     let include_dir = install_dir.join("include");
     let lib_dir = install_dir.join("lib");
+    let is_windows_msvc = env::var("TARGET")
+        .map(|target| target.contains("windows-msvc"))
+        .unwrap_or(false);
 
     // Quick cache check
-    let static_ok = lib_dir.join("liblivox_lidar_sdk_static.a").exists()
-        || lib_dir.join("livox_lidar_sdk_static.lib").exists();
-    let shared_ok = lib_dir.join("liblivox_lidar_sdk_shared.so").exists()
-        || lib_dir.join("livox_lidar_sdk_shared.dll").exists()
-        || lib_dir.join("liblivox_lidar_sdk_shared.dll").exists();
+    let static_ok = if is_windows_msvc {
+        lib_dir.join("livox_lidar_sdk_static.lib").exists()
+    } else {
+        lib_dir.join("liblivox_lidar_sdk_static.a").exists()
+            || lib_dir.join("livox_lidar_sdk_static.lib").exists()
+    };
+    let shared_ok = if is_windows_msvc {
+        lib_dir.join("livox_lidar_sdk_shared.lib").exists()
+            || lib_dir.join("liblivox_lidar_sdk_shared.dll.a").exists()
+    } else {
+        lib_dir.join("liblivox_lidar_sdk_shared.so").exists()
+            || lib_dir.join("livox_lidar_sdk_shared.dll").exists()
+            || lib_dir.join("liblivox_lidar_sdk_shared.dll").exists()
+    };
     let headers_ok = include_dir.join("livox_lidar_api.h").exists();
 
     if headers_ok && (static_ok || shared_ok) {
@@ -462,7 +474,28 @@ fn build_livox_sdk2(src_root: &Path, tag: &str) -> (PathBuf, PathBuf) {
         build_dir.display()
     );
 
+    if is_windows_msvc {
+        let cache_path = build_dir.join("CMakeCache.txt");
+        if let Ok(cache) = fs::read_to_string(&cache_path) {
+            if cache.contains("CMAKE_GENERATOR:INTERNAL=Ninja")
+                || cache.contains("CMAKE_GENERATOR:INTERNAL=MinGW Makefiles")
+            {
+                println_build!(
+                    "Removing incompatible CMake cache at {} (generator mismatch for MSVC target)",
+                    build_dir.display()
+                );
+                let _ = fs::remove_dir_all(&build_dir);
+                ensure_directory(&build_dir);
+            }
+        }
+    }
+
     let mut configure = Command::new("cmake");
+    if is_windows_msvc {
+        let generator = env::var("LIVOX_SDK2_CMAKE_GENERATOR")
+            .unwrap_or_else(|_| "Visual Studio 18 2022".to_string());
+        configure.arg("-G").arg(generator).arg("-A").arg("x64");
+    }
     configure
         .arg("-S")
         .arg(src_root)
