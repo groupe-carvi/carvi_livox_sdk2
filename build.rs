@@ -650,6 +650,11 @@ fn build_bindings(include_dir: &Path) {
         .compile("carvi_livox_sdk2_binding");
 }
 
+#[cfg(not(target_os = "windows"))]
+fn find_msvc_cl_path() -> Option<PathBuf> {
+    unreachable!("find_msvc_cl_path is only reachable on Windows")
+}
+
 #[cfg(target_os = "windows")]
 fn find_msvc_cl_path() -> Option<PathBuf> {
     let vswhere = PathBuf::from(
@@ -676,6 +681,11 @@ fn find_msvc_cl_path() -> Option<PathBuf> {
 
     let cl = latest.join(r"bin\Hostx64\x64\cl.exe");
     cl.exists().then_some(cl)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_windows_sdk_bin_x64() -> Option<PathBuf> {
+    unreachable!("find_windows_sdk_bin_x64 is only reachable on Windows")
 }
 
 #[cfg(target_os = "windows")]
@@ -711,6 +721,11 @@ fn apply_path_overrides(cmd: &mut Command, prepended_paths: &[PathBuf]) {
     if let Ok(joined) = env::join_paths(merged) {
         cmd.env("PATH", joined);
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_msvc_env_overrides(_cmd: &mut Command, _cl_path: &Path) {
+    unreachable!("apply_msvc_env_overrides is only reachable on Windows")
 }
 
 #[cfg(target_os = "windows")]
